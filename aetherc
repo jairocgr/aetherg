@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+#
+# aetherc — CLI client to aetherg server (aetherg process)
+#
+# MIT License
+#
+# Copyright (c) 2021 @jairocgr
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+
+import socket
+import sys
+import json
+
+
+class ByteSource:
+    def __init__(self, sock, buffsize=1024):
+        self.sock = sock
+        self.buffsize = buffsize
+        self.buff = []
+        self.pos = 0
+
+    def load_input(self):
+        self.buff = self.sock.recv(self.buffsize)
+        self.pos = 0
+        if len(self.buff) == 0:
+            raise Exception("Try to read a closed socket!")
+
+    def has_unread_input(self):
+        return len(self.buff) > 0 and self.pos < len(self.buff)
+
+    def popch(self):
+        ch = self.buff[self.pos];
+        self.pos = self.pos + 1
+        return ch
+
+    def get(self):
+        if self.has_unread_input():
+            return self.popch();
+        self.load_input()
+        return self.get()
+
+
+class Response:
+    def __init__(self, type):
+        self.type = type
+        self.content_size = 0
+        self.content = []
+        self.code = []
+
+    def content_string(self):
+        return bytes(self.content).decode("utf-8")
+
+    def code_string(self):
+        return bytes(self.code).decode("utf-8")
+
+
+SINIT = 'init'
+READING_SIMPLE_STRING = 'reading_simple_string'
+READING_STRING_SIZE = 'reading_string_size'
+READING_ERROR_CODE = 'reading_error_code'
+READING_STRING = 'reading_string'
+READING_ERROR_MESSAGE = 'reading_error_message'
+WAITING_EOL = 'waiting_eol'
+
+SIMPLE_STRING = 'token_simple_string'
+STRING = 'token_string'
+ERROR = 'error'
+
+MAX_SIMPLE_STRING_SIZE = 128  # in bytes
+
+EXIT_FAILURE = 1
+
+
+class Parser:
+
+    def __init__(self, sock):
+        self.src = ByteSource(sock)
+        self.state = SINIT
+
+    def next(self):
+        while True:
+            ch = self.src.get()
+
+            if self.state == SINIT:
+                if ch == ord('+'):
+                    response = Response(SIMPLE_STRING)
+                    self.state = READING_SIMPLE_STRING
+                elif ch == ord('$'):
+                    response = Response(STRING)
+                    self.state = READING_STRING_SIZE
+                elif ch == ord('-'):
+                    response = Response(ERROR)
+                    self.state = READING_ERROR_CODE
+                else:
+                    raise Exception("Unexpected char {}".format(ch))
+
+            elif self.state == READING_SIMPLE_STRING:
+                if ch == ord('\r'):
+                    self.state = WAITING_EOL
+                elif ch == ord('\n'):
+                    self.state = SINIT
+                    return response
+                else:
+                    self.state = READING_SIMPLE_STRING
+                    response.content.append(ch)
+                    if len(response.content) > MAX_SIMPLE_STRING_SIZE:
+                        emsg = "Simple string bigger than {}".format(MAX_SIMPLE_STRING_SIZE)
+                        raise Exception(emsg)
+
+            elif self.state == READING_STRING_SIZE:
+                if ch in range(48, 58):  # Test if ch is a ASCII number
+                    self.state = READING_STRING_SIZE
+                    value = int(chr(ch))
+                    response.content_size = (response.content_size * 10) + value
+                elif ch == ord('\r'):
+                    # TODO: should go to a specific state?
+                    self.state = READING_STRING_SIZE
+                elif ch == ord('\n'):
+                    self.state = READING_STRING
+                else:
+                    raise Exception("Expecting num for string size, given {}".format(ch))
+
+            elif self.state == READING_ERROR_CODE:
+                if ch in range(65, 91):  # Test if uppercase letter
+                    self.state = READING_ERROR_CODE
+                    response.code.append(ch)
+                elif ch in range(48, 58):  # Test if is a ASCII number
+                    self.state = READING_ERROR_CODE
+                    response.code.append(ch)
+                elif ch == ord('_'):  # _ is the only allowed code
+                    self.state = READING_ERROR_CODE
+                    response.code.append(ch)
+                elif ch == ord(' '):
+                    self.state = READING_ERROR_MESSAGE
+                else:
+                    raise Exception("Unexpected char in error code {}".format(ch))
+
+            elif self.state == READING_STRING:
+                if len(response.content) < response.content_size:
+                    self.state = READING_STRING
+                    response.content.append(ch)
+                else:
+                    self.state = READING_SIMPLE_STRING
+                    response.content.append(ch)
+
+            elif self.state == READING_ERROR_MESSAGE:
+                if ch == ord('\r'):
+                    self.state = WAITING_EOL
+                elif ch == ord('\n'):
+                    self.state = SINIT
+                    return response
+                else:
+                    self.state = READING_ERROR_MESSAGE
+                    response.content.append(ch)
+                    if len(response.content) > MAX_SIMPLE_STRING_SIZE:
+                        emsg = "Error string bigger than {}".format(MAX_SIMPLE_STRING_SIZE)
+                        raise Exception(emsg)
+
+            elif self.state == WAITING_EOL:
+                if ch == ord('\n'):
+                    self.state = SINIT
+                    return response
+                elif ch == ord('\r'):
+                    self.state = WAITING_EOL
+                else:
+                    raise Exception("Expecting EOL but {} given".format(ch))
+
+            else:
+                raise Exception("Illegal parser state \"{}\"".format(self.state))
+
+
+class AetherClient:
+    verbose = False
+
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_INET)
+        self.sock.connect((self.host, self.port))
+        self.parser = Parser(self.sock)
+
+    def close(self):
+        self.sock.close()
+
+    def log(self, message):
+        if self.verbose:
+            print(message)
+
+    def send(self, command):
+        # Append command with the EOL pair
+        cmd_line = command + "\r\n"
+        self.log(">sending {}".format(cmd_line.encode()))
+        self.sock.sendall(cmd_line.encode())
+
+    def read(self):
+        return self.parser.next()
+
+    def connected(self):
+        try:
+            data = self.sock.recv(16, socket.MSG_DONTWAIT | socket.MSG_PEEK)
+            if len(data) == 0:
+                return False
+            else:
+                return True
+        except BlockingIOError:
+            return True  # Socket is open but reading from it would block
+        except Exception:
+            return False
+
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+
+def sysarg(index, default_value):
+    return sys.argv[index] if len(sys.argv) > index else default_value
+
+
+def sysargint(index, default_value):
+    return int(sysarg(index, default_value))
+
+
+def valid_json(string):
+    try:
+        json.loads(string)
+        return True
+    except ValueError:
+        return False
+
+
+def json_object_or_array(string):
+    strip = string.strip()
+    return strip.startswith('[') or strip.startswith('{')
+
+
+def pretty_json(json_string):
+    json_object = json.loads(json_string)
+    return json.dumps(json_object, indent=2)
+
+
+def setup():
+    global server, host, port
+
+    host = sysarg(1, "localhost")
+    port = sysargint(2, 3000)
+
+    print("Connecting to aetherg server at {}:{}...".format(host, port))
+
+    server = AetherClient(host, port)
+    server.connect()
+
+    server.send("PING")
+    response = server.read()
+    if response.type == ERROR:
+        eprint("")
+        eprint(" error \033[31m{}\033[0m".format(response.code_string()))
+        eprint(" {}".format(response.content_string()))
+        eprint("")
+        exit(EXIT_FAILURE)
+
+
+def ask_cmd():
+    prompt = "aetherg$ "  # .format(host, port)
+    inn = input(prompt).strip()
+    if len(inn) == 0:
+        print("\033[37mEmpty command\033[0m")
+        return ask_cmd()
+    else:
+        return inn
+
+
+def interact():
+    print("We're ready! Send in-line commands to server:")
+    print("")
+    while True:
+        cmd = ask_cmd()
+        server.send(cmd)
+        response = server.read()
+        if response.type == SIMPLE_STRING:
+            print("")
+            print(" {}".format(response.content_string()))
+            print("")
+            if response.content_string() == "BYE":
+                break
+        elif response.type == STRING:
+            content = response.content_string()
+            if valid_json(content) and json_object_or_array(content):
+                print("")
+                print("\033[37msize {} bytes\033[0m".format(response.content_size))
+                print(pretty_json(content))
+                print("")
+            else:
+                print("")
+                print(" \033[37msize {} bytes\033[0m".format(response.content_size))
+                print(" {}".format(content))
+                print("")
+        elif response.type == ERROR:
+            eprint("")
+            eprint(" error \033[31m{}\033[0m".format(response.code_string()))
+            eprint(" {}".format(response.content_string()))
+            eprint("")
+        if not server.connected():
+            eprint("Disconnected from server")
+            return
+
+    print("Closing connection...")
+    server.close()
+
+
+def main():
+    setup()
+    interact()
+
+
+if __name__ == "__main__":
+    main()
