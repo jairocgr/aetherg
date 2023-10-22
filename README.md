@@ -10,13 +10,13 @@ To run a master read and write instance:
 
 ```bash
 go build .
-./aether -p 3000 # Run master server at port 3000
+./aetherg -p 3000 # Run master server at port 3000
 ```
 
 To run a read replica (read-only) instance:
 
 ```bash
-./aether -r -p 3001 # Run read replica at port 3001
+./aetherg -r -p 3001 # Run read replica at port 3001
 ```
 
 ## How to Use
