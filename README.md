@@ -1,6 +1,6 @@
 # Aetherg
 
-Aetherg is a redis-like key-value database writen in [Go](https://go.dev) for educational purpose only.
+Aetherg is a Redis-like key-value database written in [Go](https://go.dev) for educational purposes only.
 
 ![Aetherg Running](images/terminal.png)
 
